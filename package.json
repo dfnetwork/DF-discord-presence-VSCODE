@@ -1,0 +1,48 @@
+{
+  "name": "dfnetwork-vscode-presence",
+  "displayName": "DF Network Rich Presence",
+  "publisher": "dfnetwork",
+  "description": "Muestra en Discord tu proyecto, archivo y líneas desde VSCode. Telemetría opcional y backups manuales.",
+  "version": "0.2.1",
+  "license": "CC-BY-NC-4.0",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Other"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DF-Network/DF-DISCORD-PRESENCE"
+  },
+  "icon": "images/df_icon.png",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:dfpresence.resetTimer",
+    "onCommand:dfpresence.configureTelemetry",
+    "onCommand:dfpresence.createBackup"
+  ],
+
+  "main": "out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "typescript": "^4.9.5",
+    "@types/node": "^14.18.0",
+    "@types/vscode": "^1.60.0",
+    "vsce": "^2.11.0"
+  },
+  "dependencies": {
+    "discord-rpc": "^3.2.0",
+    "archiver": "^5.3.1",
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.6.9"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "dfpresence.resetTimer", "title": "DF Presence: Reset Session Timer" },
+      { "command": "dfpresence.configureTelemetry", "title": "DF Presence: Configurar Telemetría" },
+      { "command": "dfpresence.createBackup", "title": "DF Presence: Crear Backup del Workspace" }
+    ]
+  }
+}
