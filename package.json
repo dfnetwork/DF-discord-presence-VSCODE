@@ -1,24 +1,23 @@
 {
   "name": "dfnetwork-vscode-presence",
   "displayName": "DF Network Rich Presence",
-  "publisher": "dfnetwork",
-  "description": "Muestra en Discord tu proyecto, archivo y líneas desde VSCode. Telemetría opcional y backups manuales.",
-  "version": "0.2.1",
-  "license": "CC-BY-NC-4.0",
-  "engines": { "vscode": "^1.60.0" },
-  "categories": ["Other"],
+  "publisher": "DF-Network",
+  "description": "Muestra en Discord tu proyecto, archivo y líneas desde VSCode",
+  "version": "1.3.5",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/DF-Network/DF-DISCORD-PRESENCE"
   },
   "icon": "images/df_icon.png",
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:dfpresence.resetTimer",
-    "onCommand:dfpresence.configureTelemetry",
-    "onCommand:dfpresence.createBackup"
+    "onStartupFinished"
   ],
-
   "main": "out/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -27,22 +26,114 @@
     "package": "vsce package"
   },
   "devDependencies": {
-    "typescript": "^4.9.5",
-    "@types/node": "^14.18.0",
+    "@types/node": "^14.14.37",
     "@types/vscode": "^1.60.0",
-    "vsce": "^2.11.0"
+    "typescript": "^4.0.0",
+    "vsce": "^1.97.0"
   },
   "dependencies": {
-    "discord-rpc": "^3.2.0",
-    "archiver": "^5.3.1",
-    "form-data": "^4.0.0",
-    "node-fetch": "^2.6.9"
+    "@types/archiver": "^7.0.0",
+    "archiver": "^7.0.1",
+    "discord-rpc": "^3.2.0"
   },
   "contributes": {
     "commands": [
-      { "command": "dfpresence.resetTimer", "title": "DF Presence: Reset Session Timer" },
-      { "command": "dfpresence.configureTelemetry", "title": "DF Presence: Configurar Telemetría" },
-      { "command": "dfpresence.createBackup", "title": "DF Presence: Crear Backup del Workspace" }
-    ]
+      {
+        "command": "dfpresence.resetTimer",
+        "title": "DF Presence: Reset Session Timer"
+      },
+      {
+        "command": "dfpresence.showStats",
+        "title": "DF Presence: Show Workspace Statistics"
+      },
+      {
+        "command": "dfpresence.createBackup",
+        "title": "Backup"
+      },
+      {
+        "command": "dfpresence.showTelemetryStats",
+        "title": "DF Presence: Show Telemetry Statistics"
+      },
+      {
+        "command": "dfpresence.configureTelemetry",
+        "title": "DF Presence: Configure Telemetry"
+      }
+    ],
+    "configuration": {
+      "title": "DF Network Rich Presence",
+      "properties": {
+        "dfpresence.discord.clientId": {
+          "type": "string",
+          "default": "1443545245525610506",
+          "description": "Discord Application Client ID"
+        },
+        "dfpresence.discord.largeImageKey": {
+          "type": "string",
+          "default": "df_large",
+          "description": "Large image key from Discord app assets"
+        },
+        "dfpresence.discord.largeImageText": {
+          "type": "string",
+          "default": "DF Network",
+          "description": "Large image hover text"
+        },
+        "dfpresence.discord.smallImageKey": {
+          "type": "string",
+          "default": "df_small",
+          "description": "Small image key from Discord app assets"
+        },
+        "dfpresence.discord.smallImageText": {
+          "type": "string",
+          "default": "Coding",
+          "description": "Small image hover text"
+        },
+        "dfpresence.discord.button1Label": {
+          "type": "string",
+          "default": "DF Store",
+          "description": "Label for first button"
+        },
+        "dfpresence.discord.button1Url": {
+          "type": "string",
+          "default": "https://dfstore.tebex.io/",
+          "description": "URL for first button"
+        },
+        "dfpresence.discord.button2Label": {
+          "type": "string",
+          "default": "DF Network",
+          "description": "Label for second button"
+        },
+        "dfpresence.discord.button2Url": {
+          "type": "string",
+          "default": "https://dfnetwork.in/",
+          "description": "URL for second button"
+        },
+        "dfpresence.customization.noFileOpenText": {
+          "type": "string",
+          "default": "No File Open",
+          "description": "Text to show when no file is open"
+        },
+        "dfpresence.customization.useThousandsSeparator": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use thousands separator in line numbers (e.g., 2,442 instead of 2442)"
+        },
+        "dfpresence.telemetry.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable telemetry collection (local stats only)"
+        },
+        "dfpresence.backup.excludePatterns": {
+          "type": "array",
+          "default": [
+            "node_modules",
+            ".git",
+            "out",
+            "dist",
+            "build"
+          ],
+          "description": "Patterns to exclude from backup"
+        }
+      }
+    }
   }
 }

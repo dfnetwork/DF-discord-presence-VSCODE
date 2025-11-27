@@ -1,0 +1,36 @@
+{
+  "branding": {
+    "name": "DF Network",
+    "displayName": "DF Network Rich Presence",
+    "description": "Muestra en Discord tu proyecto, archivo y líneas desde VSCode"
+  },
+  "discord": {
+    "clientId": "1443545245525610506",
+    "images": {
+      "largeImageKey": "df_large",
+      "largeImageText": "df Store",
+      "smallImageKey": "df_small",
+      "smallImageText": "df Project"
+    },
+    "buttons": [
+      {
+        "label": "df Store",
+        "url": "https://dfstore.tebex.io/"
+      },
+      {
+        "label": "df Network",
+        "url": "https://dfnetwork.in/"
+      }
+    ]
+  },
+  "customization": {
+    "noFileOpenText": "No File Open",
+    "lineFormatStyle": "colon",
+    "useThousandsSeparator": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DF-Network/DF-DISCORD-PRESENCE"
+  },
+  "icon": "images/df_icon.png"
+}

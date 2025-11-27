@@ -2,86 +2,215 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import archiver from 'archiver';
-import FormData from 'form-data';
-import fetch from 'node-fetch';
-import { getWebhookUrl } from './telemetry';
 
-export async function createWorkspaceZip(context: vscode.ExtensionContext): Promise<string | null> {
+/**
+ * Configuración de backup desde config.json
+ */
+export interface BackupConfig {
+  enabled?: boolean;
+  excludePatterns?: string[];
+  defaultBackupLocation?: string;
+  webhookUrl?: string;
+}
+
+/**
+ * Crea un backup del workspace actual
+ */
+export async function createWorkspaceBackup(context: vscode.ExtensionContext): Promise<string | null> {
   const folders = vscode.workspace.workspaceFolders;
   if (!folders || folders.length === 0) {
-    vscode.window.showErrorMessage('No hay workspace abierto para crear backup.');
+    vscode.window.showErrorMessage('No workspace open to create backup.');
     return null;
   }
 
   const root = folders[0].uri.fsPath;
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const zipName = `dfnetwork-backup-${timestamp}.zip`;
-  const outPath = path.join(root, zipName);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+  const workspaceName = path.basename(root);
+  const backupName = `${workspaceName}-backup-${timestamp}`;
 
-  const output = fs.createWriteStream(outPath);
-  const archive = archiver('zip', { zlib: { level: 9 } });
+  // Preguntar al usuario dónde guardar el backup
+  const saveUri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(path.join(root, '..', backupName + '.zip')),
+    filters: { 'Zip Archives': ['zip'] }
+  });
 
+  if (!saveUri) {
+    return null; // Usuario canceló
+  }
+
+  try {
+    // Crear lista de archivos a incluir
+    const filesToBackup = await collectFilesForBackup(root);
+
+    vscode.window.showInformationMessage(
+      `Creating backup with ${filesToBackup.length} files...`
+    );
+
+    // Crear el archivo zip
+    const zipPath = await createZipArchive(root, filesToBackup, saveUri.fsPath);
+
+    vscode.window.showInformationMessage(
+      `Backup created successfully: ${zipPath}`
+    );
+
+    return zipPath;
+  } catch (err) {
+    console.error('Backup error:', err);
+    vscode.window.showErrorMessage(`Backup failed: ${err}`);
+    return null;
+  }
+}
+
+/**
+ * Recolecta archivos para backup excluyendo node_modules, .git, etc.
+ */
+async function collectFilesForBackup(rootPath: string): Promise<string[]> {
+  const excludePatterns = [
+    'node_modules',
+    '.git',
+    'out',
+    'dist',
+    'build',
+    '.vscode-test',
+    '*.vsix',
+    '*.log',
+    '.DS_Store',
+    'Thumbs.db'
+  ];
+
+  const files: string[] = [];
+
+  function walkDir(dir: string) {
+    const items = fs.readdirSync(dir);
+
+    for (const item of items) {
+      const fullPath = path.join(dir, item);
+      const relativePath = path.relative(rootPath, fullPath);
+
+      // Verificar si debe excluirse
+      const shouldExclude = excludePatterns.some(pattern => {
+        if (pattern.startsWith('*')) {
+          return relativePath.endsWith(pattern.substring(1));
+        }
+        return relativePath.includes(pattern);
+      });
+
+      if (shouldExclude) continue;
+
+      const stat = fs.statSync(fullPath);
+      if (stat.isDirectory()) {
+        walkDir(fullPath);
+      } else {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  walkDir(rootPath);
+  return files;
+}
+
+/**
+ * Crea un archivo ZIP con los archivos especificados
+ */
+async function createZipArchive(rootPath: string, files: string[], outputPath: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    output.on('close', () => resolve(outPath));
-    archive.on('error', (err) => {
-      console.error('Archive error', err);
-      reject(null);
+    const output = fs.createWriteStream(outputPath);
+    const archive = archiver('zip', {
+      zlib: { level: 9 } // Nivel de compresión máximo
     });
 
-    archive.pipe(output);
-    archive.glob('**/*', {
-      cwd: root,
-      dot: true,
-      ignore: ['**/node_modules/**', '**/.git/**']
+    output.on('close', () => {
+      console.log(`Backup created: ${archive.pointer()} total bytes`);
+      resolve(outputPath);
     });
+
+    archive.on('error', (err) => {
+      reject(err);
+    });
+
+    archive.on('warning', (err) => {
+      if (err.code === 'ENOENT') {
+        console.warn('Archive warning:', err);
+      } else {
+        reject(err);
+      }
+    });
+
+    // Conectar el archiver al stream de salida
+    archive.pipe(output);
+
+    // Añadir cada archivo al zip
+    for (const file of files) {
+      const relativePath = path.relative(rootPath, file);
+      archive.file(file, { name: relativePath });
+    }
+
+    // Finalizar el archivo
     archive.finalize();
   });
 }
 
-export async function backupAndMaybeUpload(context: vscode.ExtensionContext) {
-  const zipPath = await createWorkspaceZip(context);
-  if (!zipPath) return;
+/**
+ * Obtiene estadísticas del workspace
+ */
+export async function getWorkspaceStats(): Promise<WorkspaceStats | null> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    return null;
+  }
 
-  const action = await vscode.window.showInformationMessage(
-    `Backup creado: ${zipPath}`,
-    'Abrir carpeta',
-    'Subir a webhook (si está configurado)',
-    'Cancelar'
-  );
+  const root = folders[0].uri.fsPath;
+  const files = await collectFilesForBackup(root);
 
-  if (action === 'Abrir carpeta') {
-    const folder = path.dirname(zipPath);
-    vscode.env.openExternal(vscode.Uri.file(folder));
-    return;
-  } else if (action === 'Subir a webhook (si está configurado)') {
-    const webhook = getWebhookUrl(context);
-    if (!webhook) {
-      vscode.window.showErrorMessage('No hay webhook configurado. Define uno en configuración de telemetría.');
-      return;
-    }
+  let totalSize = 0;
+  const filesByType: Record<string, number> = {};
 
+  for (const file of files) {
     try {
-      await uploadFileToWebhook(zipPath, webhook);
-      vscode.window.showInformationMessage('Backup subido correctamente al webhook.');
+      const stat = fs.statSync(file);
+      totalSize += stat.size;
+
+      const ext = path.extname(file) || 'no-extension';
+      filesByType[ext] = (filesByType[ext] || 0) + 1;
     } catch (err) {
-      console.error(err);
-      vscode.window.showErrorMessage('Error subiendo backup al webhook: ' + String(err));
+      // Ignorar archivos que no se pueden leer
     }
   }
+
+  return {
+    totalFiles: files.length,
+    totalSize,
+    filesByType,
+    workspaceName: path.basename(root)
+  };
 }
 
-async function uploadFileToWebhook(filePath: string, webhookUrl: string) {
-  const form = new FormData();
-  form.append('file', fs.createReadStream(filePath));
-  form.append('meta', JSON.stringify({ name: path.basename(filePath), timestamp: new Date().toISOString() }));
+export interface WorkspaceStats {
+  totalFiles: number;
+  totalSize: number;
+  filesByType: Record<string, number>;
+  workspaceName: string;
+}
 
-  const res = await fetch(webhookUrl, {
-    method: 'POST',
-    body: form as any,
-    headers: (form.getHeaders ? form.getHeaders() : {})
-  } as any);
-
-  if (!res.ok) {
-    throw new Error(`Upload failed: ${res.status} ${res.statusText}`);
+/**
+ * Muestra estadísticas del workspace
+ */
+export async function showWorkspaceStats() {
+  const stats = await getWorkspaceStats();
+  if (!stats) {
+    vscode.window.showErrorMessage('No workspace open.');
+    return;
   }
+
+  const sizeMB = (stats.totalSize / (1024 * 1024)).toFixed(2);
+  const topTypes = Object.entries(stats.filesByType)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([ext, count]) => `${ext}: ${count}`)
+    .join(', ');
+
+  vscode.window.showInformationMessage(
+    `Workspace: ${stats.workspaceName} | Files: ${stats.totalFiles} | Size: ${sizeMB} MB | Top types: ${topTypes}`
+  );
 }

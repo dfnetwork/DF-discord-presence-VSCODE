@@ -1,182 +1,601 @@
 import * as vscode from 'vscode';
 import { PresenceManager, PresenceInfo } from './presence';
-import { ensureTelemetryConsent, sendTelemetry, setWebhookUrl, getWebhookUrl, TelemetryLevel } from './telemetry';
-import { backupAndMaybeUpload } from './backup';
+import * as path from 'path';
+import * as fs from 'fs';
+import { createWorkspaceBackup, showWorkspaceStats } from './backup';
+import { ensureTelemetryConsent, showTelemetryStats, TelemetryCollector, sendTelemetry } from './telemetry';
 
-const CLIENT_ID = '1218551789553582161';
+/**
+ * Obtiene la configuración desde VS Code Settings
+ * PRIORIDAD: Settings > config.json > defaults
+ */
+function getConfig() {
+    const vsConfig = vscode.workspace.getConfiguration('dfpresence');
+
+    // Intentar cargar config.json como fallback
+    let fileConfig: any = {};
+    try {
+        const configPath = path.join(__dirname, '..', 'config.json');
+        fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (err) {
+        console.log('config.json not found, using VS Code settings only');
+    }
+
+    return {
+        discord: {
+            clientId: vsConfig.get<string>('discord.clientId') || fileConfig.discord?.clientId || '1443545245525610506',
+            images: {
+                largeImageKey: vsConfig.get<string>('discord.largeImageKey') || fileConfig.discord?.images?.largeImageKey || 'df_large',
+                largeImageText: vsConfig.get<string>('discord.largeImageText') || fileConfig.discord?.images?.largeImageText || 'DF Network',
+                smallImageKey: vsConfig.get<string>('discord.smallImageKey') || fileConfig.discord?.images?.smallImageKey || 'df_small',
+                smallImageText: vsConfig.get<string>('discord.smallImageText') || fileConfig.discord?.images?.smallImageText || 'Coding'
+            },
+            buttons: [
+                {
+                    label: vsConfig.get<string>('discord.button1Label') || fileConfig.discord?.buttons?.[0]?.label || 'DF Store',
+                    url: vsConfig.get<string>('discord.button1Url') || fileConfig.discord?.buttons?.[0]?.url || 'https://dfstore.tebex.io/'
+                },
+                {
+                    label: vsConfig.get<string>('discord.button2Label') || fileConfig.discord?.buttons?.[1]?.label || 'DF Network',
+                    url: vsConfig.get<string>('discord.button2Url') || fileConfig.discord?.buttons?.[1]?.url || 'https://dfnetwork.in/'
+                }
+            ]
+        },
+        customization: {
+            noFileOpenText: vsConfig.get<string>('customization.noFileOpenText') || fileConfig.customization?.noFileOpenText || 'No File Open',
+            lineFormatStyle: 'colon',
+            useThousandsSeparator: vsConfig.get<boolean>('customization.useThousandsSeparator') ?? fileConfig.customization?.useThousandsSeparator ?? true
+        }
+    };
+}
 
 let presence: PresenceManager | null = null;
 let updateTimer: NodeJS.Timeout | null = null;
+let telemetryCollector: TelemetryCollector | null = null;
+let sessionStartTime = Date.now();
+let lastInteractionTime = Date.now();
 
 export async function activate(context: vscode.ExtensionContext) {
-  console.log('Activating DF Network Presence');
+    console.log('Activating DF Network Presence');
+    const workspaceName = vscode.workspace.name || 'No workspace';
 
-  // Ensure telemtry consent at startup (user can change later)
-  const level = await ensureTelemetryConsent(context);
-  console.log('Telemetry level:', level);
+    // Cargar configuración (Settings > config.json > defaults)
+    const config = getConfig();
+    const CLIENT_ID = config.discord.clientId;
 
-  if (level === 'detailed' && !getWebhookUrl(context)) {
-    const webhook = await vscode.window.showInputBox({ prompt: 'Introduce la URL del webhook para telemetría (opcional).' });
-    if (webhook) await setWebhookUrl(context, webhook);
-  }
+    presence = new PresenceManager(CLIENT_ID, workspaceName, config);
 
-  const workspaceName = vscode.workspace.name || 'No Workspace';
+    // Inicializar telemetry collector
+    telemetryCollector = new TelemetryCollector(context);
 
-  // Optional presence visuals + GitHub button (edit URL)
-  presence = new PresenceManager(CLIENT_ID, workspaceName, {
-    largeImageKey: 'df_large',
-    largeImageText: workspaceName,
-    smallImageKey: 'df_small',
-    smallImageText: 'DF Network',
-    buttons: [
-      { label: 'DF Network', url: 'https://dfnetwork.in/' },
-      { label: 'GitHub', url: 'https://github.com/tu-usuario/tu-repo' }
-    ]
-  });
-  presence.connect();
+    await presence.connect();
 
-  // Commands
-  context.subscriptions.push(
-    vscode.commands.registerCommand('dfpresence.resetTimer', () => {
-      presence?.resetTimer();
-      vscode.window.showInformationMessage('DF Presence: Session timer reset');
-    })
-  );
+    // Enviar evento de inicio de sesión
+    await sendTelemetry(context, {
+        type: 'session_start',
+        timestamp: new Date().toISOString(),
+        data: { workspace: workspaceName }
+    });
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand('dfpresence.configureTelemetry', async () => {
-      const choice = await vscode.window.showQuickPick(['none', 'basic', 'detailed'], { placeHolder: 'Selecciona nivel de telemetría' });
-      if (choice) {
-        await context.globalState.update('dfnetwork.telemetryLevel', choice);
-        vscode.window.showInformationMessage(`Telemetría: ${choice}`);
-        if (choice === 'detailed') {
-          const hook = await vscode.window.showInputBox({ prompt: 'Webhook URL para telemetría (opcional)' });
-          if (hook) await setWebhookUrl(context, hook);
+    const updatePresence = () => {
+        const editor = vscode.window.activeTextEditor;
+        const info: PresenceInfo = {};
+
+        if (editor) {
+            const doc = editor.document;
+            const file = doc.uri.scheme === 'file' ? vscode.workspace.asRelativePath(doc.uri) : doc.fileName;
+            info.file = file.split('/').pop();
+            info.language = doc.languageId;
+            info.line = editor.selection.active.line + 1;
+            info.totalLines = doc.lineCount;
+
+            // Intentar detectar si estamos dentro de una función
+            info.functionEndLine = findFunctionEndLine(editor);
+
+            const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
+            info.project = folder ? folder.name : (vscode.workspace.name || 'No workspace');
+
+            // Telemetría: rastrear uso de lenguaje
+            if (telemetryCollector && info.language) {
+                telemetryCollector.trackLanguageUsed(info.language);
+                if (info.functionEndLine) {
+                    telemetryCollector.trackFunctionDetected(info.language);
+                }
+            }
+        } else {
+            info.file = 'No file open';
+            info.language = '';
+            info.project = vscode.workspace.name || 'No workspace';
         }
-      }
-    })
-  );
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand('dfpresence.createBackup', async () => {
-      const confirm = await vscode.window.showWarningMessage(
-        '¿Crear backup del workspace y opcionalmente subir al webhook? (Se excluirán node_modules/.git)',
-        'Sí, crear backup',
-        'Cancelar'
-      );
-      if (confirm === 'Sí, crear backup') {
-        await backupAndMaybeUpload(context);
-      }
-    })
-  );
+        presence?.setActivity(info);
+    };
 
-  // Telemetry: edits
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeTextDocument(async (e) => {
-      const level = (context.globalState.get('dfnetwork.telemetryLevel') || 'none') as TelemetryLevel;
-      if (level === 'none') return;
+    const scheduleUpdate = throttle(updatePresence, 4000);
 
-      const doc = e.document;
-      const relative = vscode.workspace.asRelativePath(doc.uri);
+    setTimeout(updatePresence, 2000);
 
-      let linesChanged = 0;
-      for (const change of e.contentChanges) {
-        const start = change.range.start.line;
-        const end = change.range.end.line;
-        const added = (change.text.match(/\n/g) || []).length;
-        linesChanged += Math.abs(end - start) + Math.max(1, added);
-      }
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => {
+        lastInteractionTime = Date.now();
+        scheduleUpdate();
+    }));
+    context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(() => {
+        lastInteractionTime = Date.now();
+        scheduleUpdate();
+    }));
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(() => {
+        lastInteractionTime = Date.now();
+        scheduleUpdate();
+    }));
 
-      const payload = {
-        type: 'edit',
-        workspace: vscode.workspace.name || 'No Workspace',
-        file: relative,
-        language: doc.languageId,
-        linesChanged,
-        timestamp: new Date().toISOString()
-      };
+    updateTimer = setInterval(() => updatePresence(), 12000);
 
-      await sendTelemetry(context, payload);
-    })
-  );
+    // Comandos
+    const resetCmd = vscode.commands.registerCommand('dfpresence.resetTimer', () => {
+        presence?.resetTimer();
+        sessionStartTime = Date.now();
+        vscode.window.showInformationMessage('DF Presence: Session timer reset');
+    });
+    context.subscriptions.push(resetCmd);
 
-  // Telemetry: open file
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(async (editor) => {
-      if (!editor) return;
-      const doc = editor.document;
-      const payload = {
-        type: 'open',
-        workspace: vscode.workspace.name || 'No Workspace',
-        file: vscode.workspace.asRelativePath(doc.uri),
-        language: doc.languageId,
-        timestamp: new Date().toISOString()
-      };
-      await sendTelemetry(context, payload);
-    })
-  );
+    const statsCmd = vscode.commands.registerCommand('dfpresence.showStats', async () => {
+        await showWorkspaceStats();
+    });
+    context.subscriptions.push(statsCmd);
 
-  // Presence update routine
-  const scheduleUpdate = throttle(async () => {
-    const editor = vscode.window.activeTextEditor;
-    const info: PresenceInfo = {};
+    const backupCmd = vscode.commands.registerCommand('dfpresence.createBackup', async () => {
+        const result = await createWorkspaceBackup(context);
+        if (result) {
+            vscode.window.showInformationMessage(`Backup preparation complete: ${result}`);
+        }
+    });
+    context.subscriptions.push(backupCmd);
 
-    if (editor) {
-      const doc = editor.document;
-      info.file = doc.uri.scheme === 'file' ? vscode.workspace.asRelativePath(doc.uri) : doc.fileName;
-      info.line = editor.selection.active.line + 1;
-      info.totalLines = doc.lineCount;
-      info.language = doc.languageId;
+    const telemetryStatsCmd = vscode.commands.registerCommand('dfpresence.showTelemetryStats', async () => {
+        await showTelemetryStats(context);
+    });
+    context.subscriptions.push(telemetryStatsCmd);
 
-      const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
-      info.project = folder ? folder.name : workspaceName;
+    const configureTelemetryCmd = vscode.commands.registerCommand('dfpresence.configureTelemetry', async () => {
+        await ensureTelemetryConsent(context);
+        vscode.window.showInformationMessage('Telemetry settings updated');
+    });
+    context.subscriptions.push(configureTelemetryCmd);
 
-      const allFiles = await vscode.workspace.findFiles('**/*', '**/node_modules/**');
-      info.totalFiles = allFiles.length;
-    } else {
-      info.file = 'No file';
-      info.line = 0;
-      info.totalLines = 0;
-      info.language = '';
-      info.project = workspaceName;
-      info.totalFiles = 0;
-    }
-
-    presence?.setActivity(info);
-  }, 3000);
-
-  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(() => scheduleUpdate()));
-  context.subscriptions.push(vscode.window.onDidChangeTextEditorSelection(() => scheduleUpdate()));
-  context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(() => scheduleUpdate()));
-
-  updateTimer = setInterval(() => scheduleUpdate(), 10000);
+    context.subscriptions.push({ dispose: () => { deactivate(); } });
 }
 
 export function deactivate() {
-  if (updateTimer) {
-    clearInterval(updateTimer);
-    updateTimer = null;
-  }
-  presence?.dispose();
-  presence = null;
+    // Guardar tiempo de sesión antes de desactivar
+    if (telemetryCollector) {
+        const sessionTime = Math.floor((Date.now() - sessionStartTime) / 1000);
+        telemetryCollector.trackSessionTime(sessionTime);
+    }
+
+    if (updateTimer) {
+        clearInterval(updateTimer);
+        updateTimer = null;
+    }
+    presence?.dispose();
+    presence = null;
+    telemetryCollector = null;
+}
+
+function findFunctionEndLine(editor: vscode.TextEditor): number | undefined {
+    const doc = editor.document;
+    const currentLine = editor.selection.active.line;
+    const text = doc.getText();
+    const lines = text.split('\n');
+    const language = doc.languageId;
+
+    // Buscar hacia atrás para encontrar el inicio de una función
+    let functionStartLine = -1;
+    let braceCount = 0;
+
+    // Patrones completos para detectar inicio de funciones en TODOS los lenguajes populares
+    const functionPatterns = [
+        // JavaScript/TypeScript
+        /function\s+\w+\s*\(/,
+        /const\s+\w+\s*=\s*\([^)]*\)\s*=>/,
+        /let\s+\w+\s*=\s*\([^)]*\)\s*=>/,
+        /var\s+\w+\s*=\s*function/,
+        /\w+\s*\([^)]*\)\s*{/,
+        /=>\s*{/,
+
+        // Python
+        /def\s+\w+\s*\(/,
+        /async\s+def\s+\w+\s*\(/,
+
+        // Java/C#/Kotlin
+        /public\s+\w+\s+\w+\s*\(/,
+        /private\s+\w+\s+\w+\s*\(/,
+        /protected\s+\w+\s+\w+\s*\(/,
+        /static\s+\w+\s+\w+\s*\(/,
+        /override\s+fun\s+\w+\s*\(/,  // Kotlin
+        /fun\s+\w+\s*\(/,              // Kotlin
+
+        // C/C++
+        /\w+\s+\w+\s*\([^)]*\)\s*{/,
+        /\w+::\w+\s*\([^)]*\)\s*{/,    // C++ class methods
+
+        // Go
+        /func\s+\w+\s*\(/,
+        /func\s+\(\w+\s+\*?\w+\)\s+\w+\s*\(/,  // Go methods
+
+        // Rust
+        /fn\s+\w+/,
+        /pub\s+fn\s+\w+/,
+        /async\s+fn\s+\w+/,
+
+        // Swift
+        /func\s+\w+/,
+        /private\s+func\s+\w+/,
+        /public\s+func\s+\w+/,
+
+        // PHP
+        /function\s+\w+\s*\(/,
+        /public\s+function\s+\w+\s*\(/,
+        /private\s+function\s+\w+\s*\(/,
+        /protected\s+function\s+\w+\s*\(/,
+
+        // Ruby
+        /def\s+\w+/,
+        /def\s+self\.\w+/,
+
+        // Scala
+        /def\s+\w+\s*\(/,
+        /def\s+\w+\s*:/,
+
+        // Lua
+        /function\s+\w+\s*\(/,
+        /local\s+function\s+\w+\s*\(/,
+
+        // Perl
+        /sub\s+\w+\s*{/,
+
+        // R
+        /\w+\s*<-\s*function\s*\(/,
+        /\w+\s*=\s*function\s*\(/,
+
+        // Dart
+        /\w+\s+\w+\s*\([^)]*\)\s*{/,
+        /Future<\w+>\s+\w+\s*\(/,
+
+        // Elixir
+        /def\s+\w+/,
+        /defp\s+\w+/,
+
+        // Haskell
+        /\w+\s*::/,
+
+        // Julia
+        /function\s+\w+\s*\(/,
+
+        // Visual Basic/VBA
+        /Sub\s+\w+\s*\(/i,
+        /Function\s+\w+\s*\(/i,
+        /Private\s+Sub\s+\w+/i,
+        /Public\s+Function\s+\w+/i,
+
+        // Delphi/Object Pascal
+        /procedure\s+\w+/i,
+        /function\s+\w+/i,
+
+        // Fortran
+        /subroutine\s+\w+/i,
+        /function\s+\w+/i,
+        /program\s+\w+/i,
+
+        // Ada
+        /procedure\s+\w+/i,
+        /function\s+\w+/i,
+
+        // COBOL
+        /PROCEDURE\s+DIVISION/i,
+        /IDENTIFICATION\s+DIVISION/i,
+
+        // Objective-C
+        /[-+]\s*\(\w+\)\s*\w+/,
+
+        // F#
+        /let\s+\w+\s*\(/,
+        /let\s+rec\s+\w+/,
+
+        // Erlang
+        /\w+\s*\([^)]*\)\s*->/,
+
+        // Lisp/Scheme/Racket
+        /\(define\s+\(/,
+        /\(defun\s+\w+/,
+
+        // Prolog
+        /\w+\s*\([^)]*\)\s*:-/,
+
+        // MATLAB
+        /function\s+\[?\w+\]?\s*=\s*\w+\s*\(/,
+
+        // PowerShell
+        /function\s+\w+/i,
+        /Function\s+\w+\s*{/,
+
+        // Bash/Shell
+        /\w+\s*\(\)\s*{/,
+        /function\s+\w+\s*{/,
+
+        // SQL/PL-SQL
+        /CREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION)\s+\w+/i,
+        /PROCEDURE\s+\w+/i,
+        /FUNCTION\s+\w+/i,
+
+        // Class declarations (general)
+        /class\s+\w+/,
+        /interface\s+\w+/,
+        /struct\s+\w+/,
+        /enum\s+\w+/,
+    ];
+
+    // Buscar hacia atrás desde la línea actual
+    for (let i = currentLine; i >= 0; i--) {
+        const line = lines[i];
+
+        // Contar llaves para detectar bloques
+        for (let char of line) {
+            if (char === '}') braceCount++;
+            if (char === '{') braceCount--;
+        }
+
+        // Si encontramos una llave de apertura sin cerrar, verificamos si es inicio de función
+        if (braceCount < 0) {
+            for (let pattern of functionPatterns) {
+                if (pattern.test(line)) {
+                    functionStartLine = i;
+                    break;
+                }
+            }
+            if (functionStartLine >= 0) break;
+        }
+    }
+
+    // Manejo especial para Python (usa indentación, no llaves)
+    if (language === 'Python' && functionStartLine < 0) {
+        return findPythonFunctionEnd(lines, currentLine);
+    }
+
+    // Manejo especial para Ruby, Elixir (usan 'end' en lugar de llaves)
+    if ((language === 'Ruby' || language === 'Elixir') && functionStartLine < 0) {
+        return findEndBasedFunctionEnd(lines, currentLine, language);
+    }
+
+    // Manejo especial para Lua (usa 'end' también)
+    if (language === 'Lua' && functionStartLine < 0) {
+        return findEndBasedFunctionEnd(lines, currentLine, language);
+    }
+
+    // Manejo especial para Visual Basic/VBA (usa 'End Sub' / 'End Function')
+    if ((language === 'VB' || language === 'VBA') && functionStartLine < 0) {
+        return findVBFunctionEnd(lines, currentLine);
+    }
+
+    // Manejo especial para Fortran (usa 'END' statements)
+    if (language === 'Fortran' && functionStartLine < 0) {
+        return findFortranFunctionEnd(lines, currentLine);
+    }
+
+    // Si encontramos el inicio de una función, buscar su cierre
+    if (functionStartLine >= 0) {
+        braceCount = 0;
+        let inFunction = false;
+
+        for (let i = functionStartLine; i < lines.length; i++) {
+            const line = lines[i];
+
+            for (let char of line) {
+                if (char === '{') {
+                    braceCount++;
+                    inFunction = true;
+                }
+                if (char === '}') {
+                    braceCount--;
+                    if (inFunction && braceCount === 0) {
+                        return i + 1; // +1 porque las líneas empiezan en 0
+                    }
+                }
+            }
+        }
+    }
+
+    return undefined;
+}
+
+// Función especial para detectar el final de funciones en Python (basado en indentación)
+function findPythonFunctionEnd(lines: string[], currentLine: number): number | undefined {
+    let functionStartLine = -1;
+    let baseIndent = -1;
+
+    // Buscar hacia atrás para encontrar 'def '
+    for (let i = currentLine; i >= 0; i--) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (trimmed.startsWith('def ') || trimmed.startsWith('async def ')) {
+            functionStartLine = i;
+            // Calcular indentación base
+            baseIndent = line.search(/\S/);
+            break;
+        }
+    }
+
+    if (functionStartLine >= 0 && baseIndent >= 0) {
+        // Buscar hacia adelante para encontrar donde termina la indentación
+        for (let i = functionStartLine + 1; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmed = line.trim();
+
+            // Ignorar líneas vacías o comentarios
+            if (trimmed === '' || trimmed.startsWith('#')) {
+                continue;
+            }
+
+            const currentIndent = line.search(/\S/);
+
+            // Si la indentación vuelve al nivel base o menor, la función terminó
+            if (currentIndent <= baseIndent) {
+                return i;
+            }
+        }
+
+        // Si llegamos al final del archivo, la función termina ahí
+        return lines.length;
+    }
+
+    return undefined;
+}
+
+// Función para lenguajes que usan 'end' (Ruby, Lua, Elixir)
+function findEndBasedFunctionEnd(lines: string[], currentLine: number, language: string): number | undefined {
+    let functionStartLine = -1;
+    let endCount = 0;
+
+    // Patrones de inicio según lenguaje
+    const startPatterns = language === 'ruby'
+        ? [/def\s+\w+/, /def\s+self\.\w+/]
+        : language === 'elixir'
+        ? [/def\s+\w+/, /defp\s+\w+/]
+        : [/function\s+\w+/, /local\s+function\s+\w+/]; // Lua
+
+    // Buscar hacia atrás para encontrar el inicio de la función
+    for (let i = currentLine; i >= 0; i--) {
+        const line = lines[i].trim();
+
+        for (let pattern of startPatterns) {
+            if (pattern.test(line)) {
+                functionStartLine = i;
+                break;
+            }
+        }
+
+        if (functionStartLine >= 0) break;
+    }
+
+    if (functionStartLine >= 0) {
+        // Buscar hacia adelante para encontrar el 'end' correspondiente
+        for (let i = functionStartLine; i < lines.length; i++) {
+            const line = lines[i].trim();
+
+            // Contar 'def', 'function', etc. (abre bloque)
+            for (let pattern of startPatterns) {
+                if (pattern.test(line)) {
+                    endCount++;
+                }
+            }
+
+            // Contar 'end' (cierra bloque)
+            if (/^end\b/.test(line) || /\bend\s*$/.test(line)) {
+                endCount--;
+                if (endCount === 0) {
+                    return i + 1;
+                }
+            }
+        }
+    }
+
+    return undefined;
+}
+
+// Función para Visual Basic/VBA (usa 'End Sub' / 'End Function')
+function findVBFunctionEnd(lines: string[], currentLine: number): number | undefined {
+    let functionStartLine = -1;
+    let functionType = '';
+
+    // Buscar hacia atrás para encontrar Sub o Function
+    for (let i = currentLine; i >= 0; i--) {
+        const line = lines[i].trim();
+
+        if (/^(Public\s+|Private\s+)?Sub\s+\w+/i.test(line)) {
+            functionStartLine = i;
+            functionType = 'Sub';
+            break;
+        } else if (/^(Public\s+|Private\s+)?Function\s+\w+/i.test(line)) {
+            functionStartLine = i;
+            functionType = 'Function';
+            break;
+        }
+    }
+
+    if (functionStartLine >= 0 && functionType) {
+        // Buscar 'End Sub' o 'End Function'
+        const endPattern = new RegExp(`^End\\s+${functionType}`, 'i');
+
+        for (let i = functionStartLine + 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+
+            if (endPattern.test(line)) {
+                return i + 1;
+            }
+        }
+    }
+
+    return undefined;
+}
+
+// Función para Fortran (usa 'END SUBROUTINE' / 'END FUNCTION')
+function findFortranFunctionEnd(lines: string[], currentLine: number): number | undefined {
+    let functionStartLine = -1;
+    let functionType = '';
+    let functionName = '';
+
+    // Buscar hacia atrás para encontrar SUBROUTINE o FUNCTION
+    for (let i = currentLine; i >= 0; i--) {
+        const line = lines[i].trim();
+
+        const subroutineMatch = /^SUBROUTINE\s+(\w+)/i.exec(line);
+        const functionMatch = /^FUNCTION\s+(\w+)/i.exec(line);
+
+        if (subroutineMatch) {
+            functionStartLine = i;
+            functionType = 'SUBROUTINE';
+            functionName = subroutineMatch[1];
+            break;
+        } else if (functionMatch) {
+            functionStartLine = i;
+            functionType = 'FUNCTION';
+            functionName = functionMatch[1];
+            break;
+        }
+    }
+
+    if (functionStartLine >= 0 && functionType) {
+        // Buscar 'END SUBROUTINE nombre' o 'END FUNCTION nombre'
+        const endPattern = new RegExp(`^END\\s+${functionType}(\\s+${functionName})?`, 'i');
+
+        for (let i = functionStartLine + 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+
+            if (endPattern.test(line)) {
+                return i + 1;
+            }
+        }
+    }
+
+    return undefined;
 }
 
 function throttle(fn: (...args: any[]) => void, wait: number) {
-  let last = 0;
-  let timeout: NodeJS.Timeout | null = null;
-  return function (...args: any[]) {
-    const now = Date.now();
-    const remaining = wait - (now - last);
-    if (remaining <= 0) {
-      if (timeout) { clearTimeout(timeout); timeout = null; }
-      last = now;
-      fn.apply(null, args);
-    } else if (!timeout) {
-      timeout = setTimeout(() => {
-        last = Date.now();
-        timeout = null;
-        fn.apply(null, args);
-      }, remaining);
-    }
-  };
+    let last = 0;
+    let timeout: NodeJS.Timeout | null = null;
+    return function (...args: any[]) {
+        const now = Date.now();
+        const remaining = wait - (now - last);
+        if (remaining <= 0) {
+            if (timeout) { clearTimeout(timeout); timeout = null; }
+            last = now;
+            fn.apply(null, args);
+        } else if (!timeout) {
+            timeout = setTimeout(() => {
+                last = Date.now();
+                timeout = null;
+                fn.apply(null, args);
+            }, remaining);
+        }
+    };
 }
